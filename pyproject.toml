@@ -1,0 +1,17 @@
+[project]
+name = "codex2opencode"
+version = "0.1.0"
+description = "Personal FastMCP bridge from Codex to OpenCode."
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

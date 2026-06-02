@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex OpenCode Bridge"
+  short_description: "Use OpenCode as a session-aware coding second opinion."
+  default_prompt: "Use $codex-opencode-bridge to ask OpenCode for a focused second opinion on this coding task."
