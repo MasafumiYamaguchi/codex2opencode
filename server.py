@@ -10,6 +10,11 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 
 SERVER_NAME = "codex2opencode"
 DEFAULT_TIMEOUT_SEC = 180
@@ -28,6 +33,59 @@ mcp = FastMCP(
 )
 
 
+def _split_path_list(value: str | None) -> list[Path]:
+    if not value:
+        return []
+    return [Path(part).expanduser() for part in value.split(os.pathsep) if part.strip()]
+
+
+def _codex_config_path() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    return codex_home / "config.toml"
+
+
+def _trusted_project_roots() -> list[Path]:
+    config_path = _codex_config_path()
+    if not config_path.exists():
+        return []
+
+    try:
+        with config_path.open("rb") as f:
+            config = tomllib.load(f)
+    except Exception:
+        return []
+
+    projects = config.get("projects", {})
+    if not isinstance(projects, dict):
+        return []
+
+    roots: list[Path] = []
+    for path, project_config in projects.items():
+        if isinstance(project_config, dict) and project_config.get("trust_level") == "trusted":
+            roots.append(Path(path).expanduser())
+    return roots
+
+
+def _allowed_roots() -> list[Path]:
+    roots = [WORKSPACE_ROOT]
+    roots.extend(_trusted_project_roots())
+    roots.extend(_split_path_list(os.environ.get("CODEX2OPENCODE_ALLOWED_ROOTS")))
+
+    resolved_roots: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if resolved not in resolved_roots:
+            resolved_roots.append(resolved)
+    return resolved_roots
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _resolve_cwd(cwd: str | None) -> Path:
     candidate = WORKSPACE_ROOT if not cwd else Path(cwd).expanduser()
     if not candidate.is_absolute():
@@ -37,8 +95,10 @@ def _resolve_cwd(cwd: str | None) -> Path:
     if not resolved.is_dir():
         raise ValueError(f"cwd does not exist or is not a directory: {resolved}")
 
-    if resolved != WORKSPACE_ROOT and WORKSPACE_ROOT not in resolved.parents:
-        raise ValueError(f"cwd must be inside workspace root: {WORKSPACE_ROOT}")
+    allowed_roots = _allowed_roots()
+    if not any(_is_inside(resolved, root) for root in allowed_roots):
+        allowed = ", ".join(str(root) for root in allowed_roots)
+        raise ValueError(f"cwd must be inside an allowed root: {allowed}")
 
     return resolved
 
@@ -359,6 +419,7 @@ def opencode_status() -> dict[str, Any]:
         "path": path,
         "version": completed.stdout.strip() or completed.stderr.strip(),
         "exit_code": completed.returncode,
+        "allowed_roots": [str(root) for root in _allowed_roots()],
     }
 
 

@@ -13,7 +13,13 @@ This exposes a local stdio MCP server with these tools:
 - `opencode_work_list`: lists remembered work sessions.
 - `opencode_work_end`: forgets a remembered work session without deleting it from OpenCode.
 
-The bridge validates `cwd` so OpenCode can only be launched inside this workspace.
+The bridge validates `cwd` so OpenCode can only be launched inside allowed roots.
+Allowed roots are:
+
+- this repository,
+- projects marked `trust_level = "trusted"` in Codex `config.toml`,
+- paths listed in `CODEX2OPENCODE_ALLOWED_ROOTS`.
+
 Remembered work sessions are stored in `.codex2opencode/work-sessions.json`.
 
 ## Setup
@@ -52,6 +58,14 @@ on the client, but the command should point at this file:
 }
 ```
 
+To allow additional repositories, set `CODEX2OPENCODE_ALLOWED_ROOTS` on the MCP
+server. Use the platform path separator: `;` on Windows, `:` on macOS/Linux.
+
+```toml
+[mcp_servers.codex2opencode.env]
+CODEX2OPENCODE_ALLOWED_ROOTS = 'C:\Files\prog;D:\work'
+```
+
 ## Codex Skill
 
 This repository includes a Codex skill at `skills/codex-opencode-bridge`.
@@ -73,7 +87,7 @@ design thread, using `opencode_work_start` followed by `opencode_work_ask`.
 `opencode_ask` accepts:
 
 - `prompt`: the question to send to OpenCode.
-- `cwd`: optional working directory inside this workspace.
+- `cwd`: optional working directory inside an allowed root.
 - `agent`: optional OpenCode agent.
 - `model`: optional OpenCode model in provider/model form.
 - `attach_url`: optional `opencode serve` URL for later Phase 2 usage.

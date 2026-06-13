@@ -28,6 +28,7 @@ Use OpenCode as a task-scoped second opinion, not as a replacement for Codex's o
    - Include the goal, relevant files or observations, and the kind of response wanted.
    - Ask OpenCode for judgment, objections, missing tests, or competing approaches.
    - Do not paste large code blocks unless they are essential; point to file paths and summarize findings when possible.
+   - Pass `cwd` for the target repository when using this bridge outside the codex2opencode repo.
 
 5. Treat OpenCode output as advisory.
    - Verify claims against the worktree before editing.
@@ -41,7 +42,7 @@ Use `opencode_work_start` at the first meaningful consultation for a task:
 ```text
 work_id: short task slug
 prompt: what OpenCode should evaluate
-cwd: optional repo-relative directory
+cwd: target repository path, when outside codex2opencode
 ```
 
 Use `opencode_work_ask` for follow-ups:
@@ -54,6 +55,8 @@ prompt: focused continuation question
 Use `opencode_work_list` when unsure which work session is active.
 
 Use `opencode_work_end` after the task is complete, abandoned, or context has become misleading.
+
+If a `cwd` is rejected, check that the repository is trusted in Codex config or is included in `CODEX2OPENCODE_ALLOWED_ROOTS`.
 
 ## Prompt Patterns
 

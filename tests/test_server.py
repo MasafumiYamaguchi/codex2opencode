@@ -14,8 +14,26 @@ def test_resolve_cwd_allows_relative_workspace_path(tmp_path: Path) -> None:
     assert server._resolve_cwd("tests") == nested.resolve()
 
 
-def test_resolve_cwd_rejects_outside_workspace(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="cwd must be inside workspace root"):
+def test_resolve_cwd_allows_configured_external_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_repo = tmp_path / "external-repo"
+    external_repo.mkdir()
+    monkeypatch.setattr(server, "_allowed_roots", lambda: [server.WORKSPACE_ROOT, tmp_path])
+
+    assert server._resolve_cwd(str(external_repo)) == external_repo.resolve()
+
+
+def test_resolve_cwd_rejects_unallowed_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_repo = tmp_path / "external-repo"
+    external_repo.mkdir()
+    monkeypatch.setattr(server, "_allowed_roots", lambda: [server.WORKSPACE_ROOT])
+
+    with pytest.raises(ValueError, match="cwd must be inside an allowed root"):
         server._resolve_cwd(str(tmp_path))
 
 

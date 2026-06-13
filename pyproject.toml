@@ -5,6 +5,7 @@ description = "Personal FastMCP bridge from Codex to OpenCode."
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
+    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
