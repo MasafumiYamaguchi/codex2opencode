@@ -29,6 +29,14 @@ Use OpenCode as a task-scoped second opinion, not as a replacement for Codex's o
     - Ask OpenCode for judgment, objections, missing tests, or competing approaches.
     - Do not paste large code blocks unless they are essential; point to file paths and summarize findings when possible.
     - Pass `cwd` for the target repository when using this bridge outside the codex2opencode repo. If the user has set `CODEX2OPENCODE_DEFAULT_CWD` in the MCP server env, you can usually omit it.
+    - Prefer `mode` over hand-written framing. `mode="review"`, `mode="debug"`,
+      `mode="design"`, `mode="skeptic"`, and `mode="test-plan"` each prepend a
+      small role-specific prefix so you do not have to repeat the same wording
+      on every call. Default is `mode="none"`, which sends the prompt as-is.
+    - When you only need the headline answer, set `compact=True` to receive
+      just `ok`, `work_id`, `session_id`, `cwd`, and `text` (plus `resumed`
+      or `replaced`, and `agent_override`/`model_override` when applicable).
+      Use the full response when you need stdout, stderr, or parsed JSON.
 
 5. Treat OpenCode output as advisory.
     - Verify claims against the worktree before editing.
@@ -45,6 +53,8 @@ prompt: what OpenCode should evaluate
 cwd: target repository path, when outside codex2opencode
        (omit if CODEX2OPENCODE_DEFAULT_CWD is set on the server)
 on_exists: error | resume | replace (default: error)
+mode: none | review | debug | design | skeptic | test-plan (default: none)
+compact: true | false (default: false)
 ```
 
 `on_exists` controls what happens when the same `work_id` is reused:
@@ -61,47 +71,95 @@ on_exists: error | resume | replace (default: error)
 
 When `work_id` is new, `on_exists` is ignored.
 
+`mode` prepends a small role-specific prefix to the prompt before it is
+sent to OpenCode. The prefix is not stored on the work session, so
+follow-ups can switch modes freely. `compact=true` returns only the
+fields most callers triage on (`ok`, `work_id`, `session_id`, `cwd`,
+`text`, plus `resumed` or `replaced`, and `agent_override` or
+`model_override` when applicable); full stdout, stderr, and parsed
+JSON are omitted.
+
 Use `opencode_work_ask` for follow-ups:
 
 ```text
 work_id: omit to continue the active work, or specify explicitly
 prompt: focused continuation question
+agent: optional one-call override (defaults to stored value)
+model: optional one-call override (defaults to stored value)
+mode: none | review | debug | design | skeptic | test-plan (default: none)
+compact: true | false (default: false)
 ```
+
+`agent` and `model` on `opencode_work_ask` are per-call overrides only.
+The stored values on the work session are not modified, so the original
+setup (for example, a `reviewer` agent on a fast model) is preserved
+across follow-ups. A blank or whitespace-only override falls back to
+the stored value. When an override is applied, the response includes
+`agent_override` or `model_override` so you can confirm what was used.
 
 Use `opencode_work_list` when unsure which work session is active.
 
 The response includes a `summaries` list sorted by `last_used_at` descending
 (most recent first), with `work_id`, `session_id`, `cwd`, `agent`, `model`,
-`created_at`, `last_used_at`, and `turn_count` for each session. Use it to
-find an active session and to decide whether a work unit is stale enough
-to end.
+`created_at`, `last_used_at`, `turn_count`, and `stale` for each session.
+Use it to find an active session and to decide whether a work unit is
+stale enough to end.
 
 Use `opencode_work_end` after the task is complete, abandoned, or context has become misleading.
+
+Use `opencode_work_cleanup` when the local state file has grown. It marks
+or removes remembered sessions whose `last_used_at` is older than a
+threshold. The active `work_id` is skipped unless you pass
+`include_active=true`. Common shapes:
+
+```text
+# Dry run: list what would be removed without changing state.
+opencode_work_cleanup(older_than_seconds=604800, dry_run=true)
+
+# Flag stale sessions for review without removing them.
+opencode_work_cleanup(older_than_seconds=604800, mark_only=true)
+
+# Remove stale sessions (active is skipped by default).
+opencode_work_cleanup(older_than_seconds=2592000)
+```
+
+Marked sessions surface in `opencode_work_list` summaries with
+`stale: true`, so you can review them before deciding to remove.
 
 If a `cwd` is rejected, check that the repository is trusted in Codex config, is included in `CODEX2OPENCODE_ALLOWED_ROOTS`, or matches `CODEX2OPENCODE_DEFAULT_CWD`.
 
 ## Prompt Patterns
 
-For reviews:
+Prefer the `mode` argument to the hand-written framings below; it sends
+the same prefix without copy-pasting. The patterns are kept here for
+cases where you want to write a custom prompt.
+
+For reviews (`mode="review"`):
 
 ```text
 Review this approach for hidden risks and missing tests. Focus on behavioral regressions, not style.
 ```
 
-For debugging:
+For debugging (`mode="debug"`):
 
 ```text
 Given these symptoms and files, propose the top hypotheses and the fastest checks to distinguish them.
 ```
 
-For design:
+For design (`mode="design"`):
 
 ```text
 Compare two implementation approaches for this repo and point out failure modes I should verify locally.
 ```
 
-For counterargument:
+For counterargument (`mode="skeptic"`):
 
 ```text
 Act as a skeptical reviewer. What could be wrong with this plan, and what evidence should I gather?
+```
+
+For test planning (`mode="test-plan"`):
+
+```text
+For this change, propose concrete test cases including edge cases, regression risks, and the smallest set of checks that would give high confidence.
 ```

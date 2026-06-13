@@ -745,3 +745,650 @@ def test_invocation_log_omits_prompt_for_work_ask_when_disabled(
     assert "text" not in entry
     assert entry["tool"] == "opencode_work_ask"
     assert entry["work_id"] == "fix-auth"
+
+
+# ---------------------------------------------------------------------------
+# High value items 5/6/7/8: prompt modes, compact results, cleanup, overrides
+# ---------------------------------------------------------------------------
+
+
+def test_apply_mode_prefix_returns_prompt_unchanged_for_none() -> None:
+    assert server._apply_mode_prefix("hello", "none") == "hello"
+
+
+def test_apply_mode_prefix_prepends_role_text() -> None:
+    out = server._apply_mode_prefix("hello", "review")
+    assert out.startswith(server.PROMPT_MODE_PREFIXES["review"])
+    assert out.endswith("hello")
+
+
+def test_validate_mode_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="mode must be one of"):
+        server._validate_mode("bogus")
+
+
+@pytest.mark.parametrize(
+    "mode", ["review", "debug", "design", "skeptic", "test-plan"]
+)
+def test_apply_mode_prefix_known_modes(mode: str) -> None:
+    out = server._apply_mode_prefix("hi", mode)
+    assert out.startswith(server.PROMPT_MODE_PREFIXES[mode])
+    assert out.endswith("hi")
+
+
+@pytest.mark.parametrize(
+    "mode", ["review", "debug", "design", "skeptic", "test-plan"]
+)
+def test_opencode_ask_applies_mode_prefix(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured["prompt"] = prompt
+        return _fake_run_output(session_id=None, text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    result = server.opencode_ask(prompt="actual question", mode=mode)
+
+    assert result["ok"] is True
+    assert captured["prompt"] == server.PROMPT_MODE_PREFIXES[mode] + "actual question"
+
+
+def test_opencode_ask_rejects_unknown_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_log(tmp_path, monkeypatch)
+    called = {"run": False}
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda *a, **kw: called.__setitem__("run", True) or {},
+    )
+
+    with pytest.raises(ValueError, match="mode must be one of"):
+        server.opencode_ask(prompt="hi", mode="bogus")
+
+    assert called["run"] is False
+
+
+def test_opencode_ask_records_mode_in_invocation_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_file = _patch_log(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: _fake_run_output(session_id=None, text="ok"),
+    )
+
+    server.opencode_ask(prompt="hi", mode="review")
+
+    entry = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert entry["mode"] == "review"
+
+
+def test_opencode_ask_compact_returns_slim_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: {
+            **_fake_run_output(session_id="ses_x", text="hello"),
+            "stdout": "noisy stdout",
+            "stderr": "noisy stderr",
+            "args": ["opencode", "run", "--format", "json", prompt],
+        },
+    )
+
+    result = server.opencode_ask(prompt="hi", compact=True)
+
+    assert set(result.keys()) <= {
+        "ok",
+        "work_id",
+        "session_id",
+        "cwd",
+        "text",
+        "resumed",
+        "replaced",
+        "error",
+    }
+    assert result["text"] == "hello"
+    assert "stdout" not in result
+    assert "stderr" not in result
+    assert "args" not in result
+    assert "parsed" not in result
+
+
+def test_opencode_ask_full_response_keeps_verbose_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: {
+            **_fake_run_output(session_id=None, text="hi"),
+            "stdout": "raw",
+        },
+    )
+
+    result = server.opencode_ask(prompt="hi")
+
+    assert result["stdout"] == "raw"
+    assert result["stderr"] == ""
+
+
+def test_work_start_compact_strips_verbose_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state({"active_work_id": None, "works": {}})
+
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: {
+            **_fake_run_output(session_id="ses_c", text="hello"),
+            "stdout": "noisy",
+            "args": ["opencode", "run"],
+        },
+    )
+
+    result = server.opencode_work_start(
+        work_id="compact-1", prompt="hi", compact=True
+    )
+
+    assert result["ok"] is True
+    assert result["text"] == "hello"
+    assert result["work_id"] == "compact-1"
+    assert result["session_id"] == "ses_c"
+    assert "stdout" not in result
+    assert "args" not in result
+    assert "parsed" not in result
+
+
+def test_work_start_records_mode_in_state_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_file = _patch_log(tmp_path, monkeypatch)
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state({"active_work_id": None, "works": {}})
+
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: _fake_run_output(session_id="ses_m", text="ok"),
+    )
+
+    server.opencode_work_start(work_id="mode-it", prompt="hi", mode="design")
+
+    entry = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert entry["mode"] == "design"
+
+
+def test_work_ask_applies_mode_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                }
+            },
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured["prompt"] = prompt
+        return _fake_run_output(session_id="ses_keep", text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    result = server.opencode_work_ask(prompt="focus", mode="debug")
+
+    assert result["ok"] is True
+    assert captured["prompt"] == server.PROMPT_MODE_PREFIXES["debug"] + "focus"
+
+
+def test_work_ask_compact_strips_verbose_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                }
+            },
+        }
+    )
+
+    monkeypatch.setattr(
+        server,
+        "_run_opencode",
+        lambda prompt, **kw: {
+            **_fake_run_output(session_id="ses_keep", text="ok"),
+            "stdout": "raw",
+            "args": ["opencode", "run"],
+        },
+    )
+
+    result = server.opencode_work_ask(prompt="next", compact=True)
+
+    assert result["text"] == "ok"
+    assert "stdout" not in result
+    assert "args" not in result
+
+
+# Item 8: per-call agent/model override on follow-up
+
+
+def test_work_ask_uses_stored_agent_and_model_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "agent": "reviewer",
+                    "model": "anthropic/claude-sonnet-4",
+                }
+            },
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _fake_run_output(session_id="ses_keep", text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    server.opencode_work_ask(prompt="next")
+
+    assert captured["agent"] == "reviewer"
+    assert captured["model"] == "anthropic/claude-sonnet-4"
+
+
+def test_work_ask_agent_override_does_not_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "agent": "reviewer",
+                }
+            },
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _fake_run_output(session_id="ses_keep", text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    result = server.opencode_work_ask(prompt="next", agent="implementer")
+
+    assert captured["agent"] == "implementer"
+    assert "model_override" not in result
+    assert result["agent_override"] == "implementer"
+
+    state = server._read_state()
+    assert state["works"]["fix-auth"]["agent"] == "reviewer"
+
+
+def test_work_ask_model_override_does_not_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "model": "anthropic/claude-sonnet-4",
+                }
+            },
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _fake_run_output(session_id="ses_keep", text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    result = server.opencode_work_ask(
+        prompt="next", model="openai/gpt-5"
+    )
+
+    assert captured["model"] == "openai/gpt-5"
+    assert result["model_override"] == "openai/gpt-5"
+    assert "agent_override" not in result
+
+    state = server._read_state()
+    assert state["works"]["fix-auth"]["model"] == "anthropic/claude-sonnet-4"
+
+
+def test_work_ask_blank_override_falls_back_to_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fix-auth",
+            "works": {
+                "fix-auth": {
+                    "session_id": "ses_keep",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "agent": "reviewer",
+                }
+            },
+        }
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(prompt: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return _fake_run_output(session_id="ses_keep", text="ok")
+
+    monkeypatch.setattr(server, "_run_opencode", fake_run)
+
+    server.opencode_work_ask(prompt="next", agent="   ")
+
+    assert captured["agent"] == "reviewer"
+
+
+# Item 7: cleanup
+
+
+def test_parse_iso_timestamp_handles_z_suffix() -> None:
+    parsed = server._parse_iso_timestamp("2026-01-02T03:04:05Z")
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.year == 2026 and parsed.second == 5
+
+
+def test_parse_iso_timestamp_returns_none_for_invalid() -> None:
+    assert server._parse_iso_timestamp("not a date") is None
+    assert server._parse_iso_timestamp(None) is None
+    assert server._parse_iso_timestamp("") is None
+    assert server._parse_iso_timestamp("   ") is None
+
+
+def test_work_cleanup_rejects_negative_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state({"active_work_id": None, "works": {}})
+
+    with pytest.raises(ValueError, match="older_than_seconds must be >= 0"):
+        server.opencode_work_cleanup(older_than_seconds=-1)
+
+
+def test_work_cleanup_removes_stale_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "fresh",
+            "works": {
+                "stale": {
+                    "session_id": "ses_s",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "last_used_at": "2020-01-01T00:00:00Z",
+                    "turn_count": 1,
+                },
+                "fresh": {
+                    "session_id": "ses_f",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "created_at": "2026-06-14T10:00:00Z",
+                    "last_used_at": "2026-06-14T10:00:00Z",
+                    "turn_count": 1,
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(older_than_seconds=60)
+
+    assert result["ok"] is True
+    assert result["dry_run"] is False
+    assert result["mark_only"] is False
+    assert result["count"] == 1
+    assert result["removed"] == ["stale"]
+    assert result["stale"] == ["stale"]
+    assert "fresh" not in result["removed"]
+
+    state = server._read_state()
+    assert "stale" not in state["works"]
+    assert "fresh" in state["works"]
+
+
+def test_work_cleanup_skips_active_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "stale-active",
+            "works": {
+                "stale-active": {
+                    "session_id": "ses_a",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2020-01-01T00:00:00Z",
+                    "turn_count": 1,
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(older_than_seconds=60)
+
+    assert result["count"] == 0
+    assert result["removed"] == []
+    state = server._read_state()
+    assert "stale-active" in state["works"]
+    assert state["active_work_id"] == "stale-active"
+
+
+def test_work_cleanup_can_include_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": "stale-active",
+            "works": {
+                "stale-active": {
+                    "session_id": "ses_a",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2020-01-01T00:00:00Z",
+                    "turn_count": 1,
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(older_than_seconds=60, include_active=True)
+
+    assert result["removed"] == ["stale-active"]
+    state = server._read_state()
+    assert "stale-active" not in state["works"]
+    assert state["active_work_id"] is None
+
+
+def test_work_cleanup_dry_run_does_not_modify_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": None,
+            "works": {
+                "stale": {
+                    "session_id": "ses_s",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2020-01-01T00:00:00Z",
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(older_than_seconds=60, dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["removed"] == ["stale"]
+    assert result["threshold"].endswith("Z")
+    state = server._read_state()
+    assert "stale" in state["works"]
+
+
+def test_work_cleanup_mark_only_flags_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": None,
+            "works": {
+                "stale": {
+                    "session_id": "ses_s",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2020-01-01T00:00:00Z",
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(
+        older_than_seconds=60, mark_only=True
+    )
+
+    assert result["mark_only"] is True
+    assert result["marked"] == ["stale"]
+    assert result["removed"] == []
+
+    state = server._read_state()
+    work = state["works"]["stale"]
+    assert work["stale"] is True
+    assert "stale_marked_at" in work
+
+
+def test_work_cleanup_treats_legacy_entries_as_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": None,
+            "works": {
+                "old": {
+                    "session_id": "ses_old",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                }
+            },
+        }
+    )
+
+    result = server.opencode_work_cleanup(older_than_seconds=0)
+
+    assert result["removed"] == ["old"]
+    state = server._read_state()
+    assert "old" not in state["works"]
+
+
+def test_work_list_summaries_include_stale_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_state(tmp_path, monkeypatch)
+    server._write_state(
+        {
+            "active_work_id": None,
+            "works": {
+                "fresh": {
+                    "session_id": "ses_f",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2026-06-14T10:00:00Z",
+                },
+                "stale": {
+                    "session_id": "ses_s",
+                    "cwd": str(server.WORKSPACE_ROOT),
+                    "last_used_at": "2026-06-10T10:00:00Z",
+                    "stale": True,
+                    "stale_marked_at": "2026-06-14T09:00:00Z",
+                },
+            },
+        }
+    )
+
+    result = server.opencode_work_list()
+
+    by_id = {s["work_id"]: s for s in result["summaries"]}
+    assert by_id["fresh"]["stale"] is False
+    assert by_id["stale"]["stale"] is True
+
+
+def test_compact_result_keeps_mode_flags() -> None:
+    full = {
+        "ok": True,
+        "work_id": "w",
+        "session_id": "ses",
+        "cwd": "/r",
+        "text": "t",
+        "resumed": True,
+        "stdout": "raw",
+        "stderr": "raw",
+        "args": ["x"],
+    }
+    out = server._compact_result(full)
+    assert out == {
+        "ok": True,
+        "work_id": "w",
+        "session_id": "ses",
+        "cwd": "/r",
+        "text": "t",
+        "resumed": True,
+    }
+
+
+def test_compact_result_keeps_overrides() -> None:
+    full = {
+        "ok": True,
+        "text": "t",
+        "agent_override": "implementer",
+        "model_override": "openai/gpt-5",
+    }
+    out = server._compact_result(full)
+    assert out == full

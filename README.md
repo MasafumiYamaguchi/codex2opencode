@@ -11,6 +11,7 @@ This exposes a local stdio MCP server with these tools:
 - `opencode_work_start`: starts a named unit of work and remembers the OpenCode session ID.
 - `opencode_work_ask`: continues the current or specified unit of work with `--session`.
 - `opencode_work_list`: lists remembered work sessions.
+- `opencode_work_cleanup`: marks or removes stale work sessions by `last_used_at`.
 - `opencode_work_end`: forgets a remembered work session without deleting it from OpenCode.
 
 The bridge validates `cwd` so OpenCode can only be launched inside allowed roots.
@@ -61,6 +62,85 @@ log entries are not rewritten.
 
 Logging is best-effort: a write failure is swallowed and never breaks a
 tool call.
+
+## Prompt Modes
+
+`opencode_ask`, `opencode_work_start`, and `opencode_work_ask` all accept
+a `mode` argument that prepends a small role-specific prompt prefix so the
+caller does not have to repeat common framing. Valid values are:
+
+- `none` (default): no prefix, the prompt is sent as-is.
+- `review`: ask for a careful code review focused on risks, regressions,
+  and missing tests.
+- `debug`: ask for ranked hypotheses and the fastest checks that would
+  distinguish them.
+- `design`: ask for a comparison of approaches and the trade-offs to
+  verify locally.
+- `skeptic`: ask for an argument against the plan and the evidence that
+  would change the answer.
+- `test-plan`: ask for concrete test cases including edge cases and
+  regression risks.
+
+The mode is applied to the prompt before it is sent to OpenCode. The
+chosen mode is also recorded in each invocation log entry. When
+`opencode_work_start` is used, the mode is not stored on the work
+session; only the prompt the user actually wrote is remembered.
+
+## Compact Responses
+
+All four main tools accept a `compact: bool = False` argument. When
+`compact=True`, the response is limited to the fields most callers
+triage on:
+
+- `ok`
+- `work_id` (when applicable)
+- `session_id` (when applicable)
+- `cwd`
+- `text`
+- `resumed` / `replaced` (when applicable)
+- `agent_override` / `model_override` (when a follow-up used an override)
+- `error` (when set)
+
+Full `stdout`, `stderr`, `args`, `parsed` JSON, and event lists are
+omitted. Use the full response (the default) when you need them.
+
+## Cleanup Of Stale Sessions
+
+`opencode_work_cleanup` marks or removes remembered work sessions whose
+`last_used_at` (or, as a fallback, `created_at`) is older than a
+threshold. The active work session is skipped unless `include_active=True`
+is passed.
+
+Arguments:
+
+- `older_than_seconds` (default 7 days): staleness threshold. Entries
+  without any timestamp metadata are also treated as stale.
+- `include_active` (default `False`): include the active `work_id` in
+  the cleanup set.
+- `mark_only` (default `False`): keep the entry but set `stale: True`
+  and `stale_marked_at` to the current UTC time. Useful for review
+  before deletion.
+- `dry_run` (default `False`): report what would be affected without
+  writing state.
+
+The response lists the affected `work_id` values, plus `marked`,
+`removed`, `count`, and the ISO timestamp used as the threshold.
+`opencode_work_list` surfaces the `stale` flag on each summary so
+marked sessions are easy to spot.
+
+## Per-Call Model Or Agent Override
+
+`opencode_work_ask` accepts `agent` and `model` overrides. When either
+is provided, it is used for just that single follow-up call; the stored
+`agent` and `model` on the work session are not changed. This lets a
+caller keep the original setup (for example, a `reviewer` agent on a
+fast model) while occasionally poking the same session with a
+different agent or model (for example, to sanity-check a hypothesis
+with a stronger model). A blank or whitespace-only override falls
+back to the stored value.
+
+When an override is applied, the response includes `agent_override` or
+`model_override` so callers can confirm which value was used.
 
 ## Setup
 
@@ -135,6 +215,9 @@ design thread, using `opencode_work_start` followed by `opencode_work_ask`.
 - `attach_url`: optional `opencode serve` URL for later Phase 2 usage.
 - `session_id`: optional OpenCode session ID to continue.
 - `timeout_sec`: timeout from 1 to 900 seconds.
+- `mode`: prompt mode (see [Prompt Modes](#prompt-modes)).
+- `compact`: when `True`, return only the small set of triage fields
+  (see [Compact Responses](#compact-responses)).
 
 `opencode_work_start` accepts everything above that applies, plus:
 
@@ -145,11 +228,37 @@ design thread, using `opencode_work_start` followed by `opencode_work_ask`.
   - `"resume"` continues the existing OpenCode session with the new
     `prompt` and reuses the stored `cwd`, `agent`, `model`, and
     `attach_url`. The response includes `resumed: True`.
-  - `"replace"` forgets the previous local reference and starts a fresh
-    OpenCode session under the same `work_id`. The previous OpenCode
-    session itself is left untouched. The response includes
+  - `"replace"` forgets the previous local reference and starts a
+    fresh OpenCode session under the same `work_id`. The previous
+    OpenCode session itself is left untouched. The response includes
     `replaced: True` on success.
   When `work_id` does not exist yet, `on_exists` is ignored.
+- `mode`: prompt mode (see [Prompt Modes](#prompt-modes)).
+- `compact`: when `True`, return only the small set of triage fields
+  (see [Compact Responses](#compact-responses)).
+
+`opencode_work_ask` accepts:
+
+- `prompt`: focused continuation question.
+- `work_id`: optional; defaults to the active work session.
+- `timeout_sec`: timeout from 1 to 900 seconds.
+- `agent`: optional one-call override (see
+  [Per-Call Model Or Agent Override](#per-call-model-or-agent-override)).
+  Blank values fall back to the stored agent.
+- `model`: optional one-call override (see
+  [Per-Call Model Or Agent Override](#per-call-model-or-agent-override)).
+  Blank values fall back to the stored model.
+- `mode`: prompt mode (see [Prompt Modes](#prompt-modes)).
+- `compact`: when `True`, return only the small set of triage fields
+  (see [Compact Responses](#compact-responses)).
+
+`opencode_work_cleanup` accepts:
+
+- `older_than_seconds`: staleness threshold; default 7 days.
+- `include_active`: include the active `work_id`; default `False`.
+- `mark_only`: keep but flag entries with `stale: True`; default `False`.
+- `dry_run`: report what would change without writing state; default
+  `False`.
 
 ## One Work, One Session
 

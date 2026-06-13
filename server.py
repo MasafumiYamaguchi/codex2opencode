@@ -28,6 +28,44 @@ VALID_ON_EXISTS = ("error", "resume", "replace")
 LOG_PROMPTS_ENV = "CODEX2OPENCODE_LOG_PROMPTS"
 DEFAULT_CWD_ENV = "CODEX2OPENCODE_DEFAULT_CWD"
 LOG_PROMPTS_DISABLED_VALUES = {"false", "0", "no", "off", ""}
+DEFAULT_MODE = "none"
+VALID_MODES = (
+    "none",
+    "review",
+    "debug",
+    "design",
+    "skeptic",
+    "test-plan",
+)
+PROMPT_MODE_PREFIXES: dict[str, str] = {
+    "review": (
+        "Act as a careful code reviewer. "
+        "Point out hidden risks, behavioral regressions, and missing tests. "
+        "Focus on substance, not style.\n\n"
+    ),
+    "debug": (
+        "Act as a debugging assistant. "
+        "Given the symptoms and code references, list the top hypotheses and "
+        "the fastest checks that would distinguish them.\n\n"
+    ),
+    "design": (
+        "Act as a design collaborator. "
+        "Compare the candidate approaches, surface trade-offs, and flag failure "
+        "modes I should verify locally before committing.\n\n"
+    ),
+    "skeptic": (
+        "Act as a skeptical reviewer. "
+        "Argue against the plan, name assumptions, and list the evidence that "
+        "would change your mind.\n\n"
+    ),
+    "test-plan": (
+        "Act as a test planner. "
+        "For the change described, propose concrete test cases including edge "
+        "cases, regression risks, and the smallest set of checks that would "
+        "give high confidence.\n\n"
+    ),
+}
+DEFAULT_STALE_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 mcp = FastMCP(
     name=SERVER_NAME,
@@ -186,6 +224,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp string (with optional trailing Z) to UTC."""
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _touch_work_entry(work: dict[str, Any], *, increment_turn: bool) -> None:
     """Update timestamp and turn count on a remembered work entry in place."""
     work["last_used_at"] = _now_iso()
@@ -223,6 +279,7 @@ def _log_opencode_invocation(
     prompt: str,
     result: dict[str, Any],
     work_id: str | None = None,
+    mode: str | None = None,
 ) -> None:
     entry: dict[str, Any] = {
         "timestamp": _now_iso(),
@@ -233,6 +290,7 @@ def _log_opencode_invocation(
         "session_id": result.get("session_id"),
         "ok": result.get("ok"),
         "error": result.get("error"),
+        "mode": mode or DEFAULT_MODE,
         "prompt": prompt,
         "text": result.get("text"),
     }
@@ -245,6 +303,38 @@ def _plain_result_text(result: dict[str, Any]) -> str:
         return parsed["text"]
     stdout = result.get("stdout")
     return stdout if isinstance(stdout, str) else ""
+
+
+def _apply_mode_prefix(prompt: str, mode: str) -> str:
+    """Prepend the role prefix for a prompt mode, when one is set."""
+    prefix = PROMPT_MODE_PREFIXES.get(mode, "")
+    if not prefix:
+        return prompt
+    return prefix + prompt
+
+
+def _validate_mode(mode: str) -> str:
+    if mode not in VALID_MODES:
+        valid = ", ".join(VALID_MODES)
+        raise ValueError(f"mode must be one of: {valid} (got {mode!r})")
+    return mode
+
+
+def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a slim result with only the fields callers need for triage."""
+    keep = {
+        "ok",
+        "work_id",
+        "session_id",
+        "cwd",
+        "text",
+        "resumed",
+        "replaced",
+        "agent_override",
+        "model_override",
+        "error",
+    }
+    return {k: v for k, v in result.items() if k in keep}
 
 
 def _parse_json_events(stdout: str) -> dict[str, Any]:
@@ -351,10 +441,24 @@ def opencode_ask(
     attach_url: str | None = None,
     session_id: str | None = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    mode: str = DEFAULT_MODE,
+    compact: bool = False,
 ) -> dict[str, Any]:
-    """Ask OpenCode a focused question through `opencode run`."""
+    """Ask OpenCode a focused question through `opencode run`.
+
+    `mode` prepends a small role-specific prefix to the prompt so the caller
+    does not have to repeat common framing. Valid modes are `"none"` (default),
+    `"review"`, `"debug"`, `"design"`, `"skeptic"`, and `"test-plan"`.
+
+    `compact=True` returns only the fields most callers triage on
+    (`ok`, `work_id`, `session_id`, `cwd`, `text`, plus any mode-specific
+    flags like `resumed`/`replaced`); full stdout/stderr/parsed output is
+    omitted.
+    """
+    _validate_mode(mode)
+    effective_prompt = _apply_mode_prefix(prompt, mode)
     result = _run_opencode(
-        prompt,
+        effective_prompt,
         cwd=cwd,
         agent=agent,
         model=model,
@@ -363,7 +467,9 @@ def opencode_ask(
         timeout_sec=timeout_sec,
     )
     result["text"] = _plain_result_text(result)
-    _log_opencode_invocation("opencode_ask", prompt, result)
+    _log_opencode_invocation("opencode_ask", prompt, result, mode=mode)
+    if compact:
+        return _compact_result(result)
     return result
 
 
@@ -377,6 +483,8 @@ def opencode_work_start(
     attach_url: str | None = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     on_exists: str = "error",
+    mode: str = DEFAULT_MODE,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Start one OpenCode session for a named unit of work and remember it.
 
@@ -394,6 +502,14 @@ def opencode_work_start(
 
     When `work_id` does not exist yet, `on_exists` is ignored and the tool
     behaves like a normal first-time start.
+
+    `mode` prepends a small role-specific prefix to the prompt before it is
+    sent to OpenCode (see `opencode_ask` for the full list). The mode is
+    applied to the prompt but is not stored on the work session.
+
+    `compact=True` returns only the fields most callers triage on
+    (`ok`, `work_id`, `session_id`, `cwd`, `text`, plus `resumed`/`replaced`
+    when applicable); full stdout/stderr/parsed output is omitted.
     """
     work_id = work_id.strip()
     if not work_id:
@@ -403,6 +519,9 @@ def opencode_work_start(
         valid = ", ".join(VALID_ON_EXISTS)
         raise ValueError(f"on_exists must be one of: {valid} (got {on_exists!r})")
 
+    _validate_mode(mode)
+    effective_prompt = _apply_mode_prefix(prompt, mode)
+
     state = _read_state()
     existing = state["works"].get(work_id)
 
@@ -411,7 +530,7 @@ def opencode_work_start(
 
     if existing is not None and on_exists == "resume":
         result = _run_opencode(
-            prompt,
+            effective_prompt,
             cwd=existing.get("cwd"),
             agent=existing.get("agent"),
             model=existing.get("model"),
@@ -430,7 +549,11 @@ def opencode_work_start(
         result["session_id"] = existing["session_id"]
         result["text"] = parsed.get("text", "")
         result["resumed"] = True
-        _log_opencode_invocation("opencode_work_start", prompt, result, work_id=work_id)
+        _log_opencode_invocation(
+            "opencode_work_start", prompt, result, work_id=work_id, mode=mode
+        )
+        if compact:
+            return _compact_result(result)
         return result
 
     replacing = existing is not None and on_exists == "replace"
@@ -440,7 +563,7 @@ def opencode_work_start(
             state["active_work_id"] = None
 
     result = _run_opencode(
-        prompt,
+        effective_prompt,
         cwd=cwd,
         agent=agent,
         model=model,
@@ -474,7 +597,11 @@ def opencode_work_start(
     result["work_id"] = work_id
     result["session_id"] = session_id
     result["text"] = parsed.get("text", "")
-    _log_opencode_invocation("opencode_work_start", prompt, result, work_id=work_id)
+    _log_opencode_invocation(
+        "opencode_work_start", prompt, result, work_id=work_id, mode=mode
+    )
+    if compact:
+        return _compact_result(result)
     return result
 
 
@@ -483,8 +610,22 @@ def opencode_work_ask(
     prompt: str,
     work_id: str | None = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    agent: str | None = None,
+    model: str | None = None,
+    mode: str = DEFAULT_MODE,
+    compact: bool = False,
 ) -> dict[str, Any]:
-    """Continue the OpenCode session for the current or specified unit of work."""
+    """Continue the OpenCode session for the current or specified unit of work.
+
+    By default, the stored `cwd`, `agent`, `model`, and `attach_url` from
+    `opencode_work_start` are reused. Pass `agent` or `model` to override
+    the stored values for just this single follow-up call; the stored
+    values on the work session are not modified.
+
+    `mode` prepends a small role-specific prefix to the prompt (see
+    `opencode_ask` for the full list). `compact=True` returns only the
+    fields most callers triage on.
+    """
     state = _read_state()
     resolved_work_id = _clean_optional(work_id) or state.get("active_work_id")
     if not resolved_work_id:
@@ -494,11 +635,17 @@ def opencode_work_ask(
     if not work:
         raise ValueError(f"Unknown work_id: {resolved_work_id}")
 
+    _validate_mode(mode)
+    effective_prompt = _apply_mode_prefix(prompt, mode)
+
+    effective_agent = _clean_optional(agent) or work.get("agent")
+    effective_model = _clean_optional(model) or work.get("model")
+
     result = _run_opencode(
-        prompt,
+        effective_prompt,
         cwd=work.get("cwd"),
-        agent=work.get("agent"),
-        model=work.get("model"),
+        agent=effective_agent,
+        model=effective_model,
         attach_url=work.get("attach_url"),
         session_id=work["session_id"],
         format_json=True,
@@ -513,7 +660,15 @@ def opencode_work_ask(
     result["work_id"] = resolved_work_id
     result["session_id"] = work["session_id"]
     result["text"] = parsed.get("text", "")
-    _log_opencode_invocation("opencode_work_ask", prompt, result, work_id=resolved_work_id)
+    if agent is not None and _clean_optional(agent):
+        result["agent_override"] = _clean_optional(agent)
+    if model is not None and _clean_optional(model):
+        result["model_override"] = _clean_optional(model)
+    _log_opencode_invocation(
+        "opencode_work_ask", prompt, result, work_id=resolved_work_id, mode=mode
+    )
+    if compact:
+        return _compact_result(result)
     return result
 
 
@@ -524,7 +679,8 @@ def opencode_work_list() -> dict[str, Any]:
     Returns the raw `active_work_id` and `works` state for backward
     compatibility, plus a `summaries` list sorted by `last_used_at`
     descending (most recent first) so it is easy to scan when many
-    sessions exist.
+    sessions exist. Each summary includes a `stale` flag that is `True`
+    when the session has been marked stale by `opencode_work_cleanup`.
     """
     state = _read_state()
     summaries: list[dict[str, Any]] = []
@@ -540,6 +696,7 @@ def opencode_work_list() -> dict[str, Any]:
                 "created_at": work.get("created_at"),
                 "last_used_at": work.get("last_used_at"),
                 "turn_count": int(work.get("turn_count", 0)),
+                "stale": bool(work.get("stale", False)),
             }
         )
 
@@ -553,6 +710,87 @@ def opencode_work_list() -> dict[str, Any]:
         "count": len(summaries),
         "works": state["works"],
         "summaries": summaries,
+    }
+
+
+@mcp.tool()
+def opencode_work_cleanup(
+    older_than_seconds: int = DEFAULT_STALE_SECONDS,
+    include_active: bool = False,
+    mark_only: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Mark or remove stale remembered OpenCode work sessions.
+
+    A session is considered stale when its `last_used_at` (or, as a
+    fallback, `created_at`) is older than `older_than_seconds`. Sessions
+    that have no timestamp metadata are treated as stale so old state
+    files from before timestamps existed can still be cleaned up.
+
+    By default the active work session is skipped; pass `include_active=True`
+    to consider it as well.
+
+    By default stale sessions are removed. Pass `mark_only=True` to keep
+    them in state but flag them with `stale: True` so `opencode_work_list`
+    can surface them. Pass `dry_run=True` to report what would be
+    affected without modifying state.
+
+    Returns a summary listing the affected `work_id` values and the
+    counts of marked/removed entries.
+    """
+    if older_than_seconds < 0:
+        raise ValueError("older_than_seconds must be >= 0")
+
+    state = _read_state()
+    now = datetime.now(timezone.utc)
+    threshold_dt = datetime.fromtimestamp(now.timestamp() - older_than_seconds, tz=timezone.utc)
+    threshold = threshold_dt.timestamp()
+    active_id = state.get("active_work_id")
+
+    stale_ids: list[str] = []
+    for work_id, work in state["works"].items():
+        if not include_active and work_id == active_id:
+            continue
+        last_used = _parse_iso_timestamp(work.get("last_used_at")) or _parse_iso_timestamp(
+            work.get("created_at")
+        )
+        if last_used is None or last_used.timestamp() <= threshold:
+            stale_ids.append(work_id)
+
+    marked: list[str] = []
+    removed: list[str] = []
+    if not dry_run:
+        for work_id in stale_ids:
+            work = state["works"].get(work_id)
+            if work is None:
+                continue
+            if mark_only:
+                work["stale"] = True
+                work["stale_marked_at"] = _now_iso()
+                marked.append(work_id)
+            else:
+                state["works"].pop(work_id, None)
+                if state.get("active_work_id") == work_id:
+                    state["active_work_id"] = None
+                removed.append(work_id)
+        if marked or removed:
+            _write_state(state)
+    elif mark_only:
+        marked = list(stale_ids)
+    else:
+        removed = list(stale_ids)
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "mark_only": mark_only,
+        "include_active": include_active,
+        "older_than_seconds": older_than_seconds,
+        "threshold": threshold_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stale": list(stale_ids),
+        "marked": marked,
+        "removed": removed,
+        "count": len(stale_ids),
     }
 
 
