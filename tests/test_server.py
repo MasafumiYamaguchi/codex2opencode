@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -650,6 +651,48 @@ def test_opencode_ask_writes_invocation_log(
     assert entry["ok"] is True
     assert entry["cwd"] == str(server.WORKSPACE_ROOT)
     assert result["text"] == "plain reply"
+
+
+def test_opencode_status_reports_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "_allowed_roots", lambda: [server.WORKSPACE_ROOT, tmp_path])
+    monkeypatch.setattr(server, "_opencode_executable", lambda: "opencode.cmd")
+
+    def fake_run(*args: Any, **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(
+            cmd=["opencode.cmd", "--version"],
+            timeout=30,
+            output="partial stdout",
+            stderr="partial stderr",
+        )
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    result = server.opencode_status()
+
+    assert result["available"] is False
+    assert result["path"] == "opencode.cmd"
+    assert result["exit_code"] is None
+    assert result["error"] == "opencode --version timed out after 30 seconds"
+    assert result["stdout"] == "partial stdout"
+    assert result["stderr"] == "partial stderr"
+
+
+def test_opencode_status_reports_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_opencode_executable", lambda: "opencode.cmd")
+
+    def fake_run(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("boom")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    result = server.opencode_status()
+
+    assert result["available"] is False
+    assert result["path"] == "opencode.cmd"
+    assert result["exit_code"] is None
+    assert result["error"] == "failed to execute opencode: boom"
 
 
 def test_work_start_writes_invocation_log(

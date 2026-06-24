@@ -821,14 +821,36 @@ def opencode_status() -> dict[str, Any]:
     if path is None:
         return {"available": False, "path": None, "version": None}
 
-    completed = subprocess.run(
-        [path, "--version"],
-        cwd=WORKSPACE_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [path, "--version"],
+            cwd=WORKSPACE_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "available": False,
+            "path": path,
+            "version": None,
+            "exit_code": None,
+            "error": "opencode --version timed out after 30 seconds",
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+            "allowed_roots": [str(root) for root in _allowed_roots()],
+        }
+    except OSError as exc:
+        return {
+            "available": False,
+            "path": path,
+            "version": None,
+            "exit_code": None,
+            "error": f"failed to execute opencode: {exc}",
+            "allowed_roots": [str(root) for root in _allowed_roots()],
+        }
+
     return {
         "available": completed.returncode == 0,
         "path": path,
