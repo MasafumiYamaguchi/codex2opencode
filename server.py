@@ -861,4 +861,5 @@ def opencode_status() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # Stdio MCP servers must keep stdout clean for protocol frames only.
+    mcp.run(transport="stdio", show_banner=False, log_level="ERROR")
